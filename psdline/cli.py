@@ -6,6 +6,8 @@
 ``demo``    在本地跑一遍完整流程（到站开门 → 间隙探测 → 发车 → 批量开门 →
             门区联动 → 故障置位与解除 → 序号回绕 → 控制周期 → 清扫），用于交付
             前的真实运行检查；
+``shift-demo`` 跑一遍班次交接全流程（开班 → 挂故障/半截批量 → 冻结逐项确认 →
+            到点自动挂起 → 班组长会签 → 跨班续办 → 发车放行联动 → 台账校验）；
 ``status``  打印当前状态快照；
 ``config``  打印生效配置；
 ``reset``   清掉落盘的平台计数。
@@ -160,6 +162,99 @@ def _next_station(platform: Platform, station_id: str) -> str:
     return stations[(index + 1) % len(stations)]
 
 
+def _cmd_shift_demo(args: argparse.Namespace) -> int:
+    """跑一遍班次交接全流程：开班 → 挂故障/半截批量 → 交接冻结 → 逐项确认/挂起
+    → 会签 → 跨班恢复 → 发车放行联动 → 台账校验。"""
+
+    clock = ManualClock()
+    config = load_config(args.config) if getattr(args, "config", None) else default_config()
+    platform = build_platform(
+        config,
+        clock=clock,
+        storage_root=getattr(args, "storage_root", None) or tempfile.mkdtemp(prefix="psdline-shift-"),
+    )
+    platform.start()
+    svc = platform.shift_service
+
+    svc.register_operator(None, "L1", "甲班组长", "leader")
+    svc.register_operator(None, "L2", "乙班组长", "leader")
+    svc.register_operator(None, "A", "甲班值班员")
+    svc.register_operator(None, "B", "乙班值班员")
+    svc.plan_shift(None, "S1")
+    svc.plan_shift(None, "S2")
+    svc.roster_incoming({"operator_id": "L1"}, "S1", ["A"], "L1")
+    svc.roster_incoming({"operator_id": "L1"}, "S2", ["B"], "L2")
+    svc.open_shift(svc.check_in(None, "A", "S1"), "S1")
+    actor_a = {"token": svc.check_in(None, "A", "S1")["token"]}
+
+    # 两件在办：一件挂起故障（G02 门区，门始终关闭，不影响 G01 主门区到站）
+    # + 一件半截批量开门（批量上限 1 只开 G01，G02 被故障锁定跳过，G03/G04
+    # 延后，自动挂账 batch_open 在办事项）。
+    faults = [gate.id for gate in platform.gates.by_station(args.station) if gate.group == "G02"][:1]
+    for gate_id in faults:
+        platform.set_fault(gate_id, actor_a)
+    platform.doors.set_batch_limit(1)
+    batch = platform.batch_open(args.station, actor_a)
+
+    handover = svc.begin_handover(actor_a, "S2", deadline_s=args.deadline)
+    actor_b = {"token": svc.check_in(None, "B", "S2")["token"]}
+    item_ids = [item["id"] for item in handover["items"]]
+    acknowledged: list[str] = []
+    # 接班人逐项确认故障项；半截批量留到截止时刻自动挂起。
+    fault_items = [i["id"] for i in handover["items"] if i["kind"] == "fault"]
+    if fault_items:
+        svc.acknowledge_item(actor_b, handover["handover_id"], fault_items[0])
+        acknowledged.append(fault_items[0])
+    clock.advance(args.deadline + 1)
+    timed_out = svc.tick()
+    svc.countersign({"operator_id": "L2"}, handover["handover_id"])
+    completed = svc.complete_handover(actor_b, handover["handover_id"])
+
+    actor_b = {"token": svc.check_in(None, "B", "S2")["token"]}
+    suspended = svc.desk()["blockers"]
+    arrival = platform.arrive("T01", args.station, 0, actor_b)
+    platform.check_gap("T01", True, actor_b)
+    held_departure = platform.depart("T01", args.station, actor_b)
+    # 恢复顺序就是现场安全顺序：先清 G02 挂起故障解锁门区，再由乙班组长会签
+    # 续开半截批量（G02/G03/G04 逐区复核联锁后开完）；已确认的故障事项随清除
+    # 自动办结，挂起的批量事项经会签恢复。
+    for gate_id in faults:
+        platform.clear_fault(gate_id, actor_b)
+    resumes = []
+    batch_item_id = batch.get("work_item")
+    if batch_item_id:
+        batch_item = svc.items.require(batch_item_id)
+        if batch_item.state == "suspended":
+            resumes.append(svc.resume_item(actor_b, batch_item_id, leader_id="L2"))
+    released_departure = platform.depart("T01", args.station, actor_b)
+
+    report = {
+        "storage_root": platform.store.root,
+        "batch_item": batch.get("work_item"),
+        "handover": {
+            "id": handover["handover_id"],
+            "items": item_ids,
+            "acknowledged": acknowledged,
+            "timed_out": timed_out["timeouts"],
+        },
+        "completed": {key: completed[key] for key in ("state", "active_shift", "epoch", "suspended")},
+        "arrival_ok": arrival["ok"],
+        "departure_held": not held_departure["ok"],
+        "resumed": len(resumes),
+        "departure_released": released_departure["ok"],
+        "ledger": svc.verify_ledger(),
+        "desk": svc.desk(),
+    }
+    _dump(report)
+    ok = (
+        completed["state"] == "done"
+        and not held_departure["ok"]
+        and released_departure["ok"]
+        and report["ledger"]["ok"]
+    )
+    return 0 if ok else 1
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     platform = _build(args)
     payload = platform.status()
@@ -207,6 +302,11 @@ def build_parser() -> argparse.ArgumentParser:
     demo.add_argument("--dt", type=float, default=1.0, help="控制周期步长（秒）")
     demo.add_argument("--fast", action="store_true", help="使用可推进时钟，跳过真实等待")
     demo.set_defaults(func=_cmd_demo)
+
+    shift_demo = sub.add_parser("shift-demo", help="跑一遍班次交接全流程", parents=[common])
+    shift_demo.add_argument("--station", default="ST1", help="演示用的站台标识")
+    shift_demo.add_argument("--deadline", type=float, default=300.0, help="逐项确认时限（秒）")
+    shift_demo.set_defaults(func=_cmd_shift_demo)
 
     status = sub.add_parser("status", help="打印状态快照", parents=[common])
     status.set_defaults(func=_cmd_status)

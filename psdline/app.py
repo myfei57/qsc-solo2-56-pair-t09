@@ -47,6 +47,7 @@ from .platform import MappingRegistry, adjacent, group_keys, physical_groups, re
 from .psd import LockoutRegistry, PSD, PSDRegistry, sweep_station
 from .quota import QuotaRegistry
 from .sig import SignalController, aspect_of, depart_checked, refresh_position, signal_summary
+from .shift import ShiftService, WI_BATCH, WI_FAULT
 from .station import (
     DoorZone,
     Layout,
@@ -133,6 +134,16 @@ class Platform:
             store, self.align, self.commands, self.gates, self.lockouts
         )
         self.doors.set_batch_limit(self.config.door.batch_limit)
+
+        # 班次交接值班台：装配晚于门控/联锁，构造时自动从哈希链台账重放恢复。
+        self.shift_service = ShiftService(
+            store,
+            self.clock,
+            self.audit,
+            handover_deadline_s=self.config.shift.handover_deadline_s,
+            journal_segment=self.config.shift.journal_segment,
+        )
+        self._wire_shift_hooks()
 
         self._cycles = 0
         self._operations = 0
@@ -233,6 +244,94 @@ class Platform:
                 "line": self.namespace.line_id(),
             },
         )
+
+    # ---- 班次值班台接线 -------------------------------------------------
+
+    def _wire_shift_hooks(self) -> None:
+        """把现场事实回调注入班次服务，发现/续办/收口都重新读当前门态。"""
+
+        self.shift_service.hooks.update(
+            {
+                "active_fault_ids": self.faults.active_ids,
+                "discover_batches": self._discover_open_batches,
+                "continue_batch": self._continue_batch_item,
+                "secure_close_batch": self._secure_close_batch_item,
+            }
+        )
+
+    def _guard(self, actor: dict | None) -> None:
+        """安全动作闸门：冻结窗口 / 跨班旧代际 / 无效会话在此统一拒绝。"""
+
+        self.shift_service.require_allowed(actor)
+
+    def _discover_open_batches(self) -> dict[str, dict]:
+        """现场扫描：有开启门且不是整站全开的站台视为存在半截批量开门。"""
+
+        found: dict[str, dict] = {}
+        for station_id in self.namespace.station_ids():
+            gates = self.gates.by_station(station_id)
+            open_groups = sorted({gate.group for gate in gates if gate.open})
+            if not open_groups:
+                continue
+            all_groups = [zone.id for zone in (self.layouts.get(station_id).zones if self.layouts.get(station_id) else [])]
+            deferred = [group for group in all_groups if group not in open_groups]
+            if deferred:
+                found[station_id] = {
+                    "order": all_groups,
+                    "opened": open_groups,
+                    "deferred": deferred,
+                    "skipped": {},
+                }
+        return found
+
+    def _continue_batch_item(self, item) -> dict:
+        """恢复批量开门：按当前布局逐门区复核联锁，把剩余门区全部开完。
+
+        恢复已经过班组长会签，不再受单批上限约束（上限只约束班内例行批量）；
+        逐门区重新检查锁定状态，任一被锁就立即停手并保持事项挂起，不盲信
+        交接时的门态快照。
+        """
+
+        station_id = item.station_id
+        layout = self.layouts.get(station_id)
+        if layout is None:
+            return {"ok": False, "violations": ["layout_missing"]}
+        gates = self.gates.by_station(station_id)
+        opened_now: list[str] = []
+        blocked: dict[str, str] = {}
+        for zone in layout.zones:
+            group_gates = [gate for gate in gates if gate.group == zone.id]
+            if not group_gates:
+                blocked[zone.id] = "gate_missing"
+                continue
+            if all(gate.open for gate in group_gates):
+                continue
+            locked = [gate.id for gate in group_gates if gate.locked]
+            if locked:
+                blocked[zone.id] = f"locked:{','.join(locked)}"
+                continue
+            for gate in group_gates:
+                self.gates.set_open(gate.id, True)
+            opened_now.append(zone.id)
+        if blocked:
+            return {
+                "ok": False,
+                "violations": ["batch_not_complete"],
+                "blocked": blocked,
+                "opened_now": opened_now,
+            }
+        self.audit.record(
+            "batch_open_resumed", "", station_id, item_id=item.id, opened=len(opened_now)
+        )
+        return {"ok": True, "opened_now": opened_now}
+
+    def _secure_close_batch_item(self, item) -> None:
+        """终止批量开门时的安全收口：把该站已开的门全部关回并清扫。"""
+
+        for gate in self.gates.by_station(item.station_id):
+            if gate.open:
+                self.gates.set_open(gate.id, False)
+        self.audit.record("batch_open_secured", "", item.station_id, item_id=item.id)
 
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
         """把编排步骤逐条写事件，并记一条汇总审计。"""
@@ -346,9 +445,10 @@ class Platform:
 
     # ---- 到发编排 -----------------------------------------------------
 
-    def arrive(self, train_id: str, station_id: str, position_m: int) -> dict:
+    def arrive(self, train_id: str, station_id: str, position_m: int, actor: dict | None = None) -> dict:
         """到站到开门：信号到站 → 停稳对位 → 对位落盘 → 开门。"""
 
+        self._guard(actor)
         op_id = self.ids.labeled("arrive")
         steps: list[dict] = []
         violations: list[str] = []
@@ -443,9 +543,10 @@ class Platform:
         )
         return {**report, "group": group}
 
-    def depart(self, train_id: str, station_id: str) -> dict:
+    def depart(self, train_id: str, station_id: str, actor: dict | None = None) -> dict:
         """关门到发车：关门指令 → 间隙探测 → 关门落盘 → 发车信号。"""
 
+        self._guard(actor)
         op_id = self.ids.labeled("depart")
         steps: list[dict] = []
         if not self.quotas.consume(DEPART):
@@ -501,6 +602,22 @@ class Platform:
             }
             summary = self._record_operation(op_id, "depart", report)
             return {**report, **summary}
+        shift_release = self.shift_service.check_release(train_id, station_id)
+        if not shift_release["allowed"]:
+            violations = [
+                f"班次放行被扣: {row['item_id']}({row['state']})"
+                for row in shift_release["blockers"]
+            ]
+            report = {
+                "ok": False,
+                "train_id": train_id,
+                "station_id": station_id,
+                "steps": steps,
+                "violations": violations,
+                "shift_blockers": shift_release["blockers"],
+            }
+            summary = self._record_operation(op_id, "depart", report)
+            return {**report, **summary}
         steps.append(
             {"component": "sig", "action": "depart_signal", "detail": {"train_id": train_id}}
         )
@@ -522,9 +639,10 @@ class Platform:
         self._persist()
         return {**report, **summary}
 
-    def check_gap(self, train_id: str, clear: bool = True) -> dict:
+    def check_gap(self, train_id: str, clear: bool = True, actor: dict | None = None) -> dict:
         """确认间隙无异常，或登记一次可疑探测结果。"""
 
+        self._guard(actor)
         if clear:
             result = self.gaps.check(train_id, self.clock.now())
         else:
@@ -532,9 +650,10 @@ class Platform:
         self.audit.record("gap_probe", train_id, "", clear=clear)
         return {"ok": True, "train_id": train_id, "clear": result.clear, "violations": []}
 
-    def renumber(self, station_id: str, groups: dict[str, str]) -> dict:
+    def renumber(self, station_id: str, groups: dict[str, str], actor: dict | None = None) -> dict:
         """按最新布局重排门区映射，并按新映射联动一次。"""
 
+        self._guard(actor)
         mapping = self.mappings.renumber(station_id, groups)
         first_key = sorted(groups)[0]
         linked = open_group(self.doors, self.mappings, station_id, first_key)
@@ -548,9 +667,10 @@ class Platform:
             "violations": [],
         }
 
-    def enqueue(self, train_id: str, command_id: str, kind: str, station_id: str = "") -> dict:
+    def enqueue(self, train_id: str, command_id: str, kind: str, station_id: str = "", actor: dict | None = None) -> dict:
         """把一条门控指令排进队列。"""
 
+        self._guard(actor)
         command = enqueue(self.doors, train_id, command_id, kind, station_id)
         self.audit.record(
             "door_enqueue", train_id, station_id, command_id=command.id, command_kind=kind
@@ -571,35 +691,41 @@ class Platform:
             "violations": list(policy["failures"]),
         }
 
-    def clear_fault(self, psd_id: str) -> dict:
+    def clear_fault(self, psd_id: str, actor: dict | None = None) -> dict:
         """清除门区故障并按条件解锁。"""
 
+        self._guard(actor)
         gate = self.gates.require(psd_id)
         allowed, reason = releasable(self.gates, psd_id, True)
         if not allowed:
             return {"ok": False, "psd_id": psd_id, "locked": True, "violations": [reason]}
         self.faults.clear_fault(self.lockouts, psd_id, self.clock.now())
+        self.shift_service.note_fault_cleared(psd_id)
         self.audit.record("interlock_clear", "", gate.station, psd_id=psd_id)
         return {"ok": True, "psd_id": psd_id, "locked": False, "violations": []}
 
-    def set_fault(self, psd_id: str) -> dict:
+    def set_fault(self, psd_id: str, actor: dict | None = None) -> dict:
         """置位门区故障并锁定。"""
 
+        self._guard(actor)
         gate = self.gates.require(psd_id)
         self.faults.set_fault(self.lockouts, psd_id, self.clock.now())
+        self.shift_service.note_fault_set(psd_id, gate.station)
         self.audit.record("interlock_fault", "", gate.station, psd_id=psd_id)
         return {"ok": True, "psd_id": psd_id, "locked": True, "violations": []}
 
-    def arm(self, train_id: str, armed: bool) -> dict:
+    def arm(self, train_id: str, armed: bool, actor: dict | None = None) -> dict:
         """启用或退出一列车的联锁。"""
 
+        self._guard(actor)
         state = self.armers.arm(train_id, armed)
         self.audit.record("interlock_arm", train_id, "", armed=state)
         return {"ok": True, "train_id": train_id, "armed": state, "violations": []}
 
-    def refresh_position(self, train_id: str, position_m: int) -> dict:
+    def refresh_position(self, train_id: str, position_m: int, actor: dict | None = None) -> dict:
         """按信号刷新列车位置。"""
 
+        self._guard(actor)
         outcome = refresh_position(self.positions, train_id, position_m, self.clock.now())
         if outcome["ok"]:
             self.trend.append("train_position_m", self.clock.now(), position_m)
@@ -622,12 +748,15 @@ class Platform:
         )
         return {"ok": verdict.advanced, "verdict": verdict.as_dict(), "violations": [] if verdict.advanced else [verdict.reason]}
 
-    def batch_open(self, station_id: str) -> dict:
+    def batch_open(self, station_id: str, actor: dict | None = None) -> dict:
         """按布局里程顺序批量开门。"""
 
+        self._guard(actor)
         layout = self.layouts.get(station_id)
         zones = list(layout.zones) if layout else []
         outcome = batch_open(self.doors, station_id, zones)
+        # 半截批量（超上限延后 / 门区锁定跳过）自动挂成在办事项，交接逐项过。
+        item = self.shift_service.note_batch_open(station_id, outcome)
         nearest = nearest_zone(zones)
         self.audit.record(
             "batch_open",
@@ -644,12 +773,14 @@ class Platform:
             "deferred": outcome["deferred"],
             "skipped": outcome["skipped"],
             "nearest": nearest.id if nearest else "",
+            "work_item": item["id"] if item else "",
             "violations": [],
         }
 
-    def sweep(self, station_id: str) -> dict:
+    def sweep(self, station_id: str, actor: dict | None = None) -> dict:
         """整站清扫。"""
 
+        self._guard(actor)
         return sweep_station(self.gates, station_id)
 
     def register_dwell(self, train_id: str, seconds: float, station_id: str = "") -> dict:
@@ -674,6 +805,7 @@ class Platform:
         if dt <= 0:
             return {"ok": False, "violations": ["步长必须为正"], "cycle": self._cycles}
         self._cycles += 1
+        shift_timeouts = self.shift_service.tick()
         moment = self.clock.now()
         stale = [
             train.id for train in self.trains.list() if self.positions.stale(train.id, moment)
@@ -692,6 +824,7 @@ class Platform:
             "ok": True,
             "cycle": self._cycles,
             "dt": dt,
+            "shift_timeouts": shift_timeouts["timeouts"],
             "stale_positions": stale,
             "locked_count": interlock["locked_count"],
             "can_release_depart": interlock["can_release_depart"],
@@ -746,6 +879,7 @@ class Platform:
                 ARRIVAL: self.quotas.status(ARRIVAL),
                 DEPART: self.quotas.status(DEPART),
             },
+            "shift": self.shift_service.desk(),
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
             "trend": self.trend.snapshot(limit=4),

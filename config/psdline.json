@@ -47,6 +47,10 @@
   "audit": {
     "journal_segment": 512
   },
+  "shift": {
+    "handover_deadline_s": 300.0,
+    "journal_segment": 512
+  },
   "console": {
     "host": "127.0.0.1",
     "port": 8080

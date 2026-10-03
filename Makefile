@@ -7,5 +7,8 @@ run:
 demo:
 	PYTHONPATH=. python -m psdline --config config/psdline.json demo --fast
 
+shift-demo:
+	PYTHONPATH=. python -m psdline --config config/psdline.json shift-demo --deadline 10
+
 deadcode:
 	PYTHONPATH=. python tools/deadcode.py psdline

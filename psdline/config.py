@@ -103,6 +103,14 @@ class AuditSection:
 
 
 @dataclass(frozen=True)
+class ShiftSection:
+    """班次交接参数。"""
+
+    handover_deadline_s: float = 300.0
+    journal_segment: int = 512
+
+
+@dataclass(frozen=True)
 class ConsoleSection:
     """控制台监听地址。"""
 
@@ -124,6 +132,7 @@ class PlatformConfig:
     interlock: InterlockSection = field(default_factory=InterlockSection)
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
+    shift: ShiftSection = field(default_factory=ShiftSection)
     console: ConsoleSection = field(default_factory=ConsoleSection)
 
     @property
@@ -169,6 +178,10 @@ class PlatformConfig:
             raise ConfigError("运行配额必须为正", component="config")
         if self.audit.journal_segment <= 0:
             raise ConfigError("审计分段长度必须为正", component="config")
+        if self.shift.handover_deadline_s <= 0:
+            raise ConfigError("交接确认时限必须为正", component="config")
+        if self.shift.journal_segment <= 0:
+            raise ConfigError("班次台账分段长度必须为正", component="config")
         if not 0 < self.console.port <= 65535:
             raise ConfigError("控制台端口必须落在 1..65535", component="config")
         return self
@@ -213,6 +226,7 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "interlock": dict(config.interlock.__dict__),
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
+        "shift": dict(config.shift.__dict__),
         "console": dict(config.console.__dict__),
     }
 
@@ -233,6 +247,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         interlock=_section(InterlockSection, payload.get("interlock")),
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),
+        shift=_section(ShiftSection, payload.get("shift")),
         console=_section(ConsoleSection, payload.get("console")),
     )
     return config.validate()
