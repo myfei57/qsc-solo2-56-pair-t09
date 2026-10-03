@@ -46,6 +46,16 @@ from .ns import Namespace, NamespaceRegistry
 from .platform import MappingRegistry, adjacent, group_keys, physical_groups, resolve
 from .psd import LockoutRegistry, PSD, PSDRegistry, sweep_station
 from .quota import QuotaRegistry
+from .shift import (
+    BATCH_PARTIAL,
+    DOOR_OPEN,
+    FAULT_ACTIVE,
+    GAP_BLOCKED,
+    GATES_OPEN,
+    QUEUED_COMMAND,
+    ShiftService,
+    collect_open_items,
+)
 from .sig import SignalController, aspect_of, depart_checked, refresh_position, signal_summary
 from .station import (
     DoorZone,
@@ -133,6 +143,19 @@ class Platform:
             store, self.align, self.commands, self.gates, self.lockouts
         )
         self.doors.set_batch_limit(self.config.door.batch_limit)
+        self.shifts = ShiftService(
+            store,
+            self.clock,
+            self.bus,
+            self.audit,
+            self.ids,
+            require_supervisor=self.config.shift.require_supervisor,
+            handover_timeout_s=self.config.shift.handover_timeout_s,
+            collect=lambda now: collect_open_items(
+                self.store, self.gates, self.faults, self.gaps, now
+            ),
+        )
+        self.shifts.seed(self.config.shift.operators, self.config.shift.supervisors)
 
         self._cycles = 0
         self._operations = 0
@@ -220,6 +243,7 @@ class Platform:
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
         restore_lockouts(self.faults, self.gates, self.lockouts, not self.gaps.blocked_ids())
+        self.shifts.recover()
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -448,6 +472,19 @@ class Platform:
 
         op_id = self.ids.labeled("depart")
         steps: list[dict] = []
+        hold = self.shifts.departure_hold()
+        if hold["held"]:
+            report = {
+                "ok": False,
+                "train_id": train_id,
+                "station_id": station_id,
+                "steps": steps,
+                "violations": [
+                    f"交接事项未确认 {hold['count']} 项: {', '.join(hold['items'])}"
+                ],
+            }
+            summary = self._record_operation(op_id, "depart", report)
+            return {**report, **summary}
         if not self.quotas.consume(DEPART):
             report = {
                 "ok": False,
@@ -507,6 +544,8 @@ class Platform:
         departure = depart(self.doors, train_id, self.clock.now())
         if gate is not None:
             self.lockouts.clear(gate.id)
+        self.shifts.reconcile(DOOR_OPEN, train_id)
+        self.shifts.reconcile(QUEUED_COMMAND, train_id)
         report = {
             "ok": True,
             "train_id": train_id,
@@ -527,6 +566,7 @@ class Platform:
 
         if clear:
             result = self.gaps.check(train_id, self.clock.now())
+            self.shifts.reconcile(GAP_BLOCKED, train_id)
         else:
             result = self.gaps.probe(train_id, False, self.clock.now())
         self.audit.record("gap_probe", train_id, "", clear=clear)
@@ -572,13 +612,22 @@ class Platform:
         }
 
     def clear_fault(self, psd_id: str) -> dict:
-        """清除门区故障并按条件解锁。"""
+        """清除门区故障并按条件解锁；交接挂起中的故障必须先确认。"""
 
         gate = self.gates.require(psd_id)
+        hold = self.shifts.action_hold(FAULT_ACTIVE, psd_id)
+        if hold is not None:
+            return {
+                "ok": False,
+                "psd_id": psd_id,
+                "locked": True,
+                "violations": [f"交接事项未确认: {hold['key']}"],
+            }
         allowed, reason = releasable(self.gates, psd_id, True)
         if not allowed:
             return {"ok": False, "psd_id": psd_id, "locked": True, "violations": [reason]}
         self.faults.clear_fault(self.lockouts, psd_id, self.clock.now())
+        self.shifts.reconcile(FAULT_ACTIVE, psd_id)
         self.audit.record("interlock_clear", "", gate.station, psd_id=psd_id)
         return {"ok": True, "psd_id": psd_id, "locked": False, "violations": []}
 
@@ -623,11 +672,27 @@ class Platform:
         return {"ok": verdict.advanced, "verdict": verdict.as_dict(), "violations": [] if verdict.advanced else [verdict.reason]}
 
     def batch_open(self, station_id: str) -> dict:
-        """按布局里程顺序批量开门。"""
+        """按布局里程顺序批量开门；交接挂起中的批量必须先确认。"""
 
+        hold = self.shifts.action_hold(BATCH_PARTIAL, station_id)
+        if hold is not None:
+            self.audit.record("batch_open_held", "", station_id, item_key=hold["key"])
+            return {
+                "ok": False,
+                "station_id": station_id,
+                "order": [],
+                "opened": [],
+                "deferred": [],
+                "skipped": {},
+                "nearest": "",
+                "violations": [f"交接事项未确认: {hold['key']}"],
+            }
         layout = self.layouts.get(station_id)
         zones = list(layout.zones) if layout else []
         outcome = batch_open(self.doors, station_id, zones)
+        self.shifts.note_batch(station_id, outcome["deferred"], outcome["skipped"])
+        if not outcome["deferred"] and not outcome["skipped"]:
+            self.shifts.reconcile(BATCH_PARTIAL, station_id)
         nearest = nearest_zone(zones)
         self.audit.record(
             "batch_open",
@@ -650,7 +715,9 @@ class Platform:
     def sweep(self, station_id: str) -> dict:
         """整站清扫。"""
 
-        return sweep_station(self.gates, station_id)
+        report = sweep_station(self.gates, station_id)
+        self.shifts.reconcile(GATES_OPEN, station_id)
+        return report
 
     def register_dwell(self, train_id: str, seconds: float, station_id: str = "") -> dict:
         """登记停站时长。"""
@@ -665,6 +732,58 @@ class Platform:
             Route(train_id=train_id, origin=origin, destination=destination, distance_m=distance_m)
         )
         return {"ok": True, "route": route.__dict__, "violations": []}
+
+    # ---- 班次交接 -----------------------------------------------------
+
+    def shift_open(self, operator: str, label: str = "") -> dict:
+        """开班：仅当线上没有未封存班次时可用。"""
+
+        return self.shifts.open_shift(operator, label)
+
+    def shift_accept(self, operator: str, label: str = "") -> dict:
+        """接班：开新班次，未确认的在办事项自动挂起。"""
+
+        return self.shifts.accept_shift(operator, label)
+
+    def shift_register(self, name: str, role: str, by: str = "") -> dict:
+        """把人员登记进交接名册。"""
+
+        return self.shifts.register(name, role, by)
+
+    def handover_begin(self, operator: str) -> dict:
+        """交班发起：快照在办事项，未确认前卡住发车放行。"""
+
+        return self.shifts.begin_handover(operator)
+
+    def handover_ack(self, item_key: str, operator: str, resume: bool = False) -> dict:
+        """接班人逐项确认交接事项。"""
+
+        return self.shifts.ack(item_key, operator, resume)
+
+    def handover_resume(self, item_key: str, operator: str) -> dict:
+        """把已确认的事项转成接着办。"""
+
+        return self.shifts.resume(item_key, operator)
+
+    def handover_approve(self, supervisor: str) -> dict:
+        """班组长复核，封存交接单与交班班次。"""
+
+        return self.shifts.approve(supervisor)
+
+    def handover_abort(self, operator: str) -> dict:
+        """作废进行中的交接，交班人回到当班。"""
+
+        return self.shifts.abort(operator)
+
+    def shift_status(self) -> dict:
+        """班次与交接的状态快照。"""
+
+        return self.shifts.status()
+
+    def handover_history(self) -> dict:
+        """全部班次与交接单（含已封存）。"""
+
+        return self.shifts.history()
 
     # ---- 控制循环 -----------------------------------------------------
 
@@ -687,6 +806,7 @@ class Platform:
         self.trend.append("locked_count", moment, interlock["locked_count"])
         self.trend.append("queued_commands", moment, queued_total(self.doors))
         self.trend.append("audit_entries", moment, len(self.audit.list()))
+        handover_timeout = self.shifts.check_timeouts(moment)
         self._persist()
         return {
             "ok": True,
@@ -697,6 +817,8 @@ class Platform:
             "can_release_depart": interlock["can_release_depart"],
             "ready_trains": holding,
             "gaps": gap_summary(self.gaps, [train.id for train in self.trains.list()]),
+            "handover_holds": self.shifts.departure_hold()["count"],
+            "handover_timeout": handover_timeout,
             "violations": [],
         }
 
@@ -746,6 +868,7 @@ class Platform:
                 ARRIVAL: self.quotas.status(ARRIVAL),
                 DEPART: self.quotas.status(DEPART),
             },
+            "shift": self.shifts.status(),
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
             "trend": self.trend.snapshot(limit=4),

@@ -74,6 +74,8 @@ class Api:
         add("GET", "/api/mapping/{stationID}", self._mapping)
         add("GET", "/api/resolve", self._resolve)
         add("GET", "/api/readiness", self._readiness)
+        add("GET", "/api/shift", lambda params, body: self._platform.shift_status())
+        add("GET", "/api/shifts", lambda params, body: self._platform.handover_history())
         add("POST", "/api/arrive", self._arrive)
         add("POST", "/api/depart", self._depart)
         add("POST", "/api/gap", self._gap)
@@ -91,6 +93,14 @@ class Api:
         add("POST", "/api/dwell", self._dwell)
         add("POST", "/api/route", self._route)
         add("POST", "/api/reset-state", self._reset_state)
+        add("POST", "/api/shift/open", self._shift_open)
+        add("POST", "/api/shift/accept", self._shift_accept)
+        add("POST", "/api/shift/register", self._shift_register)
+        add("POST", "/api/handover/begin", self._handover_begin)
+        add("POST", "/api/handover/ack", self._handover_ack)
+        add("POST", "/api/handover/resume", self._handover_resume)
+        add("POST", "/api/handover/approve", self._handover_approve)
+        add("POST", "/api/handover/abort", self._handover_abort)
 
     def routes(self) -> list[dict]:
         """返回接口清单，供自检与文档核对。"""
@@ -264,3 +274,41 @@ class Api:
 
     def _reset_state(self, params: dict, body: dict) -> dict:
         return {"removed": self._platform.reset_state()}
+
+    # ---- 班次交接 -----------------------------------------------------
+
+    def _shift_open(self, params: dict, body: dict) -> dict:
+        return self._platform.shift_open(
+            _require(body, "operator"), str(body.get("label", ""))
+        )
+
+    def _shift_accept(self, params: dict, body: dict) -> dict:
+        return self._platform.shift_accept(
+            _require(body, "operator"), str(body.get("label", ""))
+        )
+
+    def _shift_register(self, params: dict, body: dict) -> dict:
+        return self._platform.shift_register(
+            _require(body, "name"), _require(body, "role"), str(body.get("by", ""))
+        )
+
+    def _handover_begin(self, params: dict, body: dict) -> dict:
+        return self._platform.handover_begin(_require(body, "operator"))
+
+    def _handover_ack(self, params: dict, body: dict) -> dict:
+        return self._platform.handover_ack(
+            _require(body, "item_key"),
+            _require(body, "operator"),
+            bool(body.get("resume", False)),
+        )
+
+    def _handover_resume(self, params: dict, body: dict) -> dict:
+        return self._platform.handover_resume(
+            _require(body, "item_key"), _require(body, "operator")
+        )
+
+    def _handover_approve(self, params: dict, body: dict) -> dict:
+        return self._platform.handover_approve(_require(body, "supervisor"))
+
+    def _handover_abort(self, params: dict, body: dict) -> dict:
+        return self._platform.handover_abort(_require(body, "operator"))

@@ -11,7 +11,7 @@ from html import escape
 
 from ..app import Platform
 
-PAGE_PATHS: tuple[str, ...] = ("/", "/trains", "/doors", "/alarms")
+PAGE_PATHS: tuple[str, ...] = ("/", "/trains", "/doors", "/alarms", "/shift")
 
 _STYLE = """
 body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; background: #101820; color: #e8eef5; }
@@ -31,6 +31,7 @@ _NAV: tuple[tuple[str, str], ...] = (
     ("/trains", "列车"),
     ("/doors", "门控"),
     ("/alarms", "告警"),
+    ("/shift", "班次"),
 )
 
 
@@ -196,11 +197,54 @@ def _alarm_page(platform: Platform) -> str:
     return _shell("告警控制台", body)
 
 
+def _shift_page(platform: Platform) -> str:
+    """班次页：当班、交接事项与放行冻结。"""
+
+    shift = platform.shift_status()
+    current = shift["current_shift"]
+    handover = shift["handover"]
+    hold = shift["departure_hold"]
+    body = _table(
+        "当班班次",
+        [
+            ("班次", current["id"] if current else "-"),
+            ("值班员", current["operator"] if current else "-"),
+            ("状态", current["state"] if current else "-"),
+            ("发车放行", "冻结" if hold["held"] else "正常"),
+            ("挂起事项", hold["count"]),
+        ],
+    )
+    items = handover["items"] if handover else []
+    body += _table(
+        "交接事项",
+        [
+            (
+                item["key"],
+                f"{item['state']} {item['summary']} 确认人 {item['acked_by'] or '-'}",
+            )
+            for item in items
+        ]
+        or [("暂无", "-")],
+    )
+    body += _table(
+        "名册与规则",
+        [
+            ("值班员", ", ".join(shift["roster"]["operators"]) or "-"),
+            ("班组长", ", ".join(shift["roster"]["supervisors"]) or "-"),
+            ("班组长复核", "需要" if shift["require_supervisor"] else "不需要"),
+            ("交接时限", f"{shift['handover_timeout_s']} s"),
+            ("已完成交接", shift["handovers_completed"]),
+        ],
+    )
+    return _shell("班次控制台", body)
+
+
 _RENDERERS = {
     "/": _station_page,
     "/trains": _train_page,
     "/doors": _door_page,
     "/alarms": _alarm_page,
+    "/shift": _shift_page,
 }
 
 

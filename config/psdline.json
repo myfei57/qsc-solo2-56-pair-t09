@@ -47,6 +47,12 @@
   "audit": {
     "journal_segment": 512
   },
+  "shift": {
+    "require_supervisor": true,
+    "handover_timeout_s": 1800.0,
+    "operators": ["operator"],
+    "supervisors": ["supervisor"]
+  },
   "console": {
     "host": "127.0.0.1",
     "port": 8080

@@ -87,6 +87,20 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     cycles = [platform.cycle(dt=args.dt) for _ in range(args.cycles)]
     final_sweep = platform.sweep(args.station)
 
+    # 班次交接：交班人发起 → 接班人确认 → 班组长复核，挂起事项确认后接着办。
+    shift = platform.shift_open("operator", "day")
+    platform.shift_register("operator2", "operator", by="supervisor")
+    platform.set_fault(_first_gate(platform, args.station))
+    platform.enqueue(args.train, "cmd-handover", "open", args.station)
+    begin = platform.handover_begin("operator")
+    accepted = platform.shift_accept("operator2", "night")
+    acks = [
+        platform.handover_ack(item["key"], "operator2", resume=True)
+        for item in accepted["handover"]["items"]
+    ]
+    approved = platform.handover_approve("supervisor")
+    cleared_after = platform.clear_fault(_first_gate(platform, args.station))
+
     # 演示自检用临时端口，避免和本机常驻服务抢 8080。
     server = ConsoleServer(platform, port=0)
     base_url = server.start()
@@ -113,6 +127,15 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],
         "final_sweep": {key: final_sweep[key] for key in ("closed", "scanned")},
+        "shift": {
+            "opened": shift["ok"],
+            "handover_items": len(begin["handover"]["items"]),
+            "accepted": accepted["ok"],
+            "acks": all(item["ok"] for item in acks),
+            "approved": approved["ok"],
+            "state": approved["handover"]["state"],
+            "cleared_after_handover": cleared_after["ok"],
+        },
         "probe": probe,
         "status": platform.status(),
     }
@@ -126,9 +149,16 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         ("cleared", cleared),
         ("sequence", sequence),
         ("departure", departure),
+        ("shift_open", shift),
+        ("handover_begin", begin),
+        ("shift_accept", accepted),
+        ("handover_approve", approved),
+        ("cleared_after_handover", cleared_after),
     ):
         if not operation.get("ok"):
             failures.extend(f"{name}:{item}" for item in operation.get("violations", []))
+    if not all(item["ok"] for item in acks):
+        failures.append("handover_ack")
     if failures:
         print(f"检查未通过: {failures}", file=sys.stderr)
         return 1

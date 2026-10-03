@@ -103,6 +103,16 @@ class AuditSection:
 
 
 @dataclass(frozen=True)
+class ShiftSection:
+    """班次交接限值与名册种子。"""
+
+    require_supervisor: bool = True
+    handover_timeout_s: float = 1800.0
+    operators: tuple[str, ...] = ("operator",)
+    supervisors: tuple[str, ...] = ("supervisor",)
+
+
+@dataclass(frozen=True)
 class ConsoleSection:
     """控制台监听地址。"""
 
@@ -124,6 +134,7 @@ class PlatformConfig:
     interlock: InterlockSection = field(default_factory=InterlockSection)
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
+    shift: ShiftSection = field(default_factory=ShiftSection)
     console: ConsoleSection = field(default_factory=ConsoleSection)
 
     @property
@@ -169,6 +180,12 @@ class PlatformConfig:
             raise ConfigError("运行配额必须为正", component="config")
         if self.audit.journal_segment <= 0:
             raise ConfigError("审计分段长度必须为正", component="config")
+        if self.shift.handover_timeout_s <= 0:
+            raise ConfigError("交接确认时限必须为正", component="config")
+        if not self.shift.operators:
+            raise ConfigError("至少登记一名值班员", component="config")
+        if self.shift.require_supervisor and not self.shift.supervisors:
+            raise ConfigError("需要班组长复核时至少登记一名班组长", component="config")
         if not 0 < self.console.port <= 65535:
             raise ConfigError("控制台端口必须落在 1..65535", component="config")
         return self
@@ -189,6 +206,10 @@ def _section(cls, payload: object):
     kwargs = {key: value for key, value in payload.items() if key in known}
     if cls is NamespaceSection and "stations" in kwargs:
         kwargs["stations"] = tuple(str(item) for item in kwargs["stations"])
+    if cls is ShiftSection:
+        for key in ("operators", "supervisors"):
+            if key in kwargs:
+                kwargs[key] = tuple(str(item) for item in kwargs[key])
     return cls(**kwargs)
 
 
@@ -213,6 +234,12 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "interlock": dict(config.interlock.__dict__),
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
+        "shift": {
+            "require_supervisor": config.shift.require_supervisor,
+            "handover_timeout_s": config.shift.handover_timeout_s,
+            "operators": list(config.shift.operators),
+            "supervisors": list(config.shift.supervisors),
+        },
         "console": dict(config.console.__dict__),
     }
 
@@ -233,6 +260,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         interlock=_section(InterlockSection, payload.get("interlock")),
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),
+        shift=_section(ShiftSection, payload.get("shift")),
         console=_section(ConsoleSection, payload.get("console")),
     )
     return config.validate()
